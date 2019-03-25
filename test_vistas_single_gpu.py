@@ -18,9 +18,10 @@ from modules.bn import InPlaceABN
 from modules.deeplab import DeeplabV3
 
 parser = argparse.ArgumentParser(description="Testing script for the Vistas segmentation model")
-parser.add_argument("--scales", metavar="LIST", type=str, default="[0.7, 1, 1.2]", help="List of scales")
+parser.add_argument("--scales", metavar="LIST", type=str, default="[0.7, 1.0, 1.2]", help="List of scales")
 parser.add_argument("--flip", action="store_true", help="Use horizontal flipping")
-parser.add_argument("--fusion-mode", metavar="NAME", type=str, choices=["mean", "voting", "max"], default="mean",
+parser.add_argument("--fusion-mode", metavar="NAME", type=str,
+                    choices=["mean", "voting", "max", "disabled"], default="mean",
                     help="How to fuse the outputs. Options: 'mean', 'voting', 'max'")
 parser.add_argument("--output-mode", metavar="NAME", type=str, choices=["palette", "raw", "prob"],
                     default="final",
@@ -93,11 +94,23 @@ class SegmentationModule(nn.Module):
         def output(self):
             return self.buffer_prob, self.buffer_cls
 
+    class _NoFusion:
+        def __init__(self, _x, _classes):
+            self.buffer = []
+
+        def update(self, sem_logits):
+            probs = functional.softmax(sem_logits, dim=1)
+            self.buffer.append(probs)
+
+        def output(self):
+            return self.buffer
+
     def __init__(self, body, head, head_channels, classes, fusion_mode="mean"):
         super(SegmentationModule, self).__init__()
         self.body = body
         self.head = head
         self.cls = nn.Conv2d(head_channels, classes, 1)
+        self.enable_resampling = fusion_mode != "disabled"
 
         self.classes = classes
         if fusion_mode == "mean":
@@ -106,6 +119,8 @@ class SegmentationModule(nn.Module):
             self.fusion_cls = SegmentationModule._VotingFusion
         elif fusion_mode == "max":
             self.fusion_cls = SegmentationModule._MaxFusion
+        elif fusion_mode == "disabled":
+            self.fusion_cls = SegmentationModule._NoFusion
 
     def _network(self, x, scale):
         if scale != 1:
@@ -128,14 +143,16 @@ class SegmentationModule(nn.Module):
         for scale in scales:
             # Main orientation
             sem_logits = self._network(x, scale)
-            sem_logits = functional.upsample(sem_logits, size=out_size, mode="bilinear")
+            if self.enable_resampling:
+                sem_logits = functional.upsample(sem_logits, size=out_size, mode="bilinear")
             fusion.update(sem_logits)
 
             # Flipped orientation
             if do_flip:
                 # Main orientation
                 sem_logits = self._network(flip(x, -1), scale)
-                sem_logits = functional.upsample(sem_logits, size=out_size, mode="bilinear")
+                if self.enable_resampling:
+                    sem_logits = functional.upsample(sem_logits, size=out_size, mode="bilinear")
                 fusion.update(flip(sem_logits, -1))
 
         return fusion.output()
@@ -180,22 +197,39 @@ def main():
             print("Testing batch [{:3d}/{:3d}]".format(batch_i + 1, len(data_loader)))
 
             img = rec["img"].cuda(non_blocking=True)
-            probs, preds = model(img, scales, args.flip)
 
-            for i, (prob, pred) in enumerate(zip(torch.unbind(probs, dim=0), torch.unbind(preds, dim=0))):
-                out_size = rec["meta"][i]["size"]
-                img_name = rec["meta"][i]["idx"]
+            if args.fusion_mode != "disabled":
+                probs, preds = model(img, scales, args.flip)
 
-                # Save prediction
-                prob = prob.cpu()
-                pred = pred.cpu()
-                pred_img = get_pred_image(pred, out_size, args.output_mode == "palette")
-                pred_img.save(path.join(args.output, img_name + ".png"))
+                for i, (prob, pred) in enumerate(zip(torch.unbind(probs, dim=0), torch.unbind(preds, dim=0))):
+                    out_size = rec["meta"][i]["size"]
+                    img_name = rec["meta"][i]["idx"]
 
-                # Optionally save probabilities
-                if args.output_mode == "prob":
-                    prob_img = get_prob_image(prob, out_size)
-                    prob_img.save(path.join(args.output, img_name + "_prob.png"))
+                    # Save prediction
+                    prob = prob.cpu()
+                    pred = pred.cpu()
+                    pred_img = get_pred_image(pred, out_size, args.output_mode == "palette")
+                    pred_img.save(path.join(args.output, img_name + ".png"))
+
+                    # Optionally save probabilities
+                    if args.output_mode == "prob":
+                        prob_img = get_prob_image(prob, out_size)
+                        prob_img.save(path.join(args.output, img_name + "_prob.png"))
+
+            else:
+                probs_per_scale = model(img, scales, args.flip)
+
+                for probs, scale in zip(probs_per_scale, scales):
+                    for i, prob in enumerate(torch.unbind(probs, dim=0)):
+                        out_size = rec["meta"][i]["size"]
+                        img_name = rec["meta"][i]["idx"]
+
+                        # Save prediction
+                        prob = prob.cpu().numpy()
+                        np.save(path.join(args.output, "{}_{}_full.png".format(img_name, scale)),
+                                prob)
+                        np.save(path.join(args.output, "{}_target_size.png".format(img_name)),
+                                np.asarray(out_size))
 
 
 def load_snapshot(snapshot_file):
@@ -296,9 +330,11 @@ def get_pred_image(tensor, out_size, with_palette):
     return img.resize(out_size, Image.NEAREST)
 
 
-def get_prob_image(tensor, out_size):
+def get_prob_image(tensor, out_size=None):
     tensor = (tensor * 255).to(torch.uint8)
     img = Image.fromarray(tensor.numpy(), mode="L")
+    if out_size is None:
+        return img
     return img.resize(out_size, Image.NEAREST)
 
 
