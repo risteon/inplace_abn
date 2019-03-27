@@ -219,17 +219,22 @@ def main():
             else:
                 probs_per_scale = model(img, scales, args.flip)
 
+                d = {}
+                ii = set()
                 for probs, scale in zip(probs_per_scale, scales):
+                    d[scale] = {}
                     for i, prob in enumerate(torch.unbind(probs, dim=0)):
-                        out_size = rec["meta"][i]["size"]
-                        img_name = rec["meta"][i]["idx"]
-
                         # Save prediction
                         prob = prob.cpu().numpy()
-                        np.save(path.join(args.output, "{}_{}_full.png".format(img_name, scale)),
-                                prob)
-                        np.save(path.join(args.output, "{}_target_size.png".format(img_name)),
-                                np.asarray(out_size))
+                        d[scale][i] = prob
+                        ii.add(i)
+
+                for i in ii:
+                    out_size = rec["meta"][i]["size"]
+                    img_name = rec["meta"][i]["idx"]
+                    np.savez(path.join(args.output, "{}_full".format(img_name)),
+                             {**{k: v[i] for k, v in d.items()},
+                              **{'target_size': np.asarray(out_size)}})
 
 
 def load_snapshot(snapshot_file):
