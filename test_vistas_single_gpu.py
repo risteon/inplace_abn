@@ -233,8 +233,7 @@ def main():
                     out_size = rec["meta"][i]["size"]
                     img_name = rec["meta"][i]["idx"]
                     np.savez(path.join(args.output, "{}_full".format(img_name)),
-                             {**{k: v[i] for k, v in d.items()},
-                              **{'target_size': np.asarray(out_size)}})
+                             **{str(k): v[i] for k, v in d.items()}, target_size=np.asarray(out_size))
 
 
 def load_snapshot(snapshot_file):
